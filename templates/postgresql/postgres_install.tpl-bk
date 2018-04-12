@@ -1,0 +1,10 @@
+#!/bin/sh
+
+apt-get install -y postgresql-9.4
+echo "CREATE ROLE kong LOGIN ENCRYPTED PASSWORD 'kong1234';" | sudo -u postgres psql
+su postgres -c "createdb kong --owner kong"
+su postgres -c "ALTER USER kong WITH SUPERUSER;"
+su postgres -c "ALTER USER kong WITH CREATEDB;"
+su postgres -c "ALTER USER kong WITH CREATEROLE;"
+
+service postgresql reload

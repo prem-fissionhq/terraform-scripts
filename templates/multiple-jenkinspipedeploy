@@ -1,0 +1,157 @@
+def builders = [:]
+def servers = ['production-1', 'production-5']
+
+for (x in servers) {
+  // Need to bind the label variable before the closure - can't do 'for (server in servers)'
+  def server = x
+  builders[server] = {
+    // 2018-01-24.1 PROD MASTER TEMPLATE - deployment script with prompt for git tag, ecr image pull tag, run
+    // master copy w/history kept in luke-prod-adidas jenkins job
+    // 2018-02-27.1 check for yml file before issuing "down"
+    // 2018-01-25.1 fixed detials typo, added gitTagName to slack not, uncommented notifyBuild and notifyCommit
+    // 2018-01-24.1 first TEMPLATE FOR PROD 
+
+    node(server) {
+      def imageTagEnvName = "LUKE_IMAGE_TAG" // tag variable used in Docker compose file
+      def component = "luke"  // illusionist, rug, naip, naim, chirpy, webconsole, botagent, airflow....
+      def environment = "production"
+      def shortEnv = 'prod' // demo or dev or preprod or prod
+      def customer = "adidas" // adidas or albertsons
+      //def branchName = "refs/tags/${gitTagName}"
+      def runSpace = "/home/ubuntu/runspace/${shortEnv}/${component}/${customer}"
+      def composeFile = "docker-compose.${shortEnv}.yml"
+      def projectName = "${component}-${shortEnv}-${customer}" // docker-compose project name (runtime label)
+
+      def gitTagName = ""
+      def nocache = "false"
+      def registryHost = "491745667832.dkr.ecr.us-east-1.amazonaws.com"
+      def repoUrl = "https://github.com/nevaai/${component}"
+
+      // used for notification
+      def logdata = ""
+      def commitId = ""
+      def authorName, commitDate, commit = ""
+      def infraArgs = "${component}-"+"${shortEnv}-"+"${customer}"
+
+      try {
+            gitTagName = input(
+            message: 'Please Input Git Tag', parameters: [
+            [$class: 'StringParameterDefinition', defaultValue: 'v1.0.0', description: 'git tag to release', name: 'gitTagName']
+            ])
+            echo ("User Input -- Git Tag: ${gitTagName}")
+          stage("docker-login"){
+              sh "sh /home/ubuntu/dockerlogin.sh"
+          }
+          stage("Pull") {
+              checkout([
+                  $class: 'GitSCM', 
+                  branches: [
+                    [name: "refs/tags/${gitTagName}"]
+                  ],
+                  doGenerateSubmoduleConfigurations: false,
+                  extensions: [
+                      [$class: 'GitLFSPull'],
+                      [$class: 'CleanBeforeCheckout'],
+                      [
+                          $class: 'SubmoduleOption', 
+                          disableSubmodules: false, 
+                          parentCredentials: true,
+                          recursiveSubmodules: false, 
+                          reference: '', 
+                          trackingSubmodules: false
+                      ]
+                  ], 
+                  submoduleCfg: [],
+                  userRemoteConfigs: [[
+                          credentialsId: 'prem-github',
+                          url: "${repoUrl}"
+                    ]]
+                ])
+
+                sh 'git log -1 > logdata'
+                sh 'git rev-parse HEAD > commit' 
+                sh 'git log -1 --format="%aN <%aE>" > author'
+                sh 'git log -1 --format=%cd > date'
+
+                commitId = "${repoUrl}" + readFile('commit').trim()
+                commit = readFile('commit').trim()
+                authorName = readFile('author').trim() 
+                commitDate = readFile('date').trim()
+
+                logdata = readFile('logdata')
+                echo "${logdata}"
+                //notifyBuild("STARTED", logdata, commitId)
+            }
+
+             stage("Pull-Image") {
+                releaseImage = docker.image("${registryHost}/${component}-release:${gitTagName}")
+                releaseImage.pull()
+            }
+
+           /*stage("Publish") {
+                sh "mkdir -p ${runSpace}"
+                // sh "/bin/echo ${imageTagEnvName}=${gitTagName} > ${runSpace}/.env" - DO NOT change TAG VERSION BEFORE YOU DOWN
+                sh "if test -f ${runSpace}/${composeFile}; then cd ${runSpace}; docker-compose -f ${runSpace}/${composeFile} -p ${projectName} down; fi;"
+                sh "cp ${env.WORKSPACE}/${composeFile} ${runSpace}/${composeFile}"
+                sh "/bin/echo ${imageTagEnvName}=${gitTagName} > ${runSpace}/.env"
+                sh "cd ${runSpace}; docker-compose -f ${runSpace}/${composeFile} -p ${projectName} up -d"
+            }*/ 
+            stage("sendbuildinfo"){
+                 buildVersion(environment,"${env.JOB_NAME}","${gitTagName}",commit)
+            }
+        } catch (e) {
+            currentBuild.result = "FAILED"
+            throw e
+        } finally {
+            notifyBuild(currentBuild.result, logdata, commitId, environment, gitTagName)
+            notifyCommits(gitTagName, commit, authorName, commitDate, infraArgs)
+        }
+    }
+
+    @NonCPS
+    def notifyBuild(String buildStatus = 'STARTED', logdata, commitId, environment, gitTagName) {
+
+        buildStatus =  buildStatus ?: 'SUCCESSFUL'
+
+        echo "${logdata} \n ${buildStatus} "
+
+        def colorName = 'RED'
+        def colorCode = '#FF0000'
+
+        def subject = "${environment} deployment ${buildStatus}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]'"
+        def summary = "${subject}, Commit details: GitTag: ${gitTagName} \n URL:  ${commitId} \n  ${logdata} Check console output at (${env.BUILD_URL})"
+
+        echo "${summary} "
+        if (buildStatus == 'STARTED') {
+            color = 'YELLOW'
+            colorCode = '#FFFF00'
+        } else if (buildStatus == 'SUCCESSFUL') {
+            color = 'GREEN'
+            colorCode = '#00FF00'
+        } else {
+            color = 'RED'
+            colorCode = '#FF0000'
+        }
+        slackSend(color: colorCode, message: summary)
+    }
+
+    @NonCPS
+    def notifyCommits(branch, commit, authorName, commitDate, parameter) {
+        echo "${parameter}"
+    //    sh '''curl -H "Content-Type: application/json" -X POST -d '{"Commit": "'''+"${commit}"+'''", "Author": "'''+"${authorName}"+'''", "Date": "'''+"${commitDate}"+'''", "Branch": "'''+"${branch}"+'''"}' http://40.0.127.107:3000/api/v1/set/'''+"${parameter}"+''''''
+    }
+    def buildVersion(envir,jobname,branch,commit){
+        def message = "'${envir}' Deployed: '${jobname}' - Branch: '${branch}' - CommitID: '${commit}'"
+        configFileProvider(
+            [configFile(fileId: 'PostSlack', variable: 'postmessage')]) {
+            //sh "/usr/bin/pip3 install slackclient"
+            sh "/usr/bin/python3.5 ${postmessage} '${message}'"
+            }
+    }
+
+
+
+      }
+    }
+
+parallel builders
